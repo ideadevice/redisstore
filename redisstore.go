@@ -7,12 +7,14 @@ import (
 	"encoding/base32"
 	"encoding/gob"
 	"errors"
-	"github.com/go-redis/redis/v9"
-	"github.com/gorilla/sessions"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/go-redis/redis/v9"
+	"github.com/gorilla/securecookie"
+	"github.com/gorilla/sessions"
 )
 
 // RedisStore stores gorilla sessions in Redis
@@ -27,13 +29,15 @@ type RedisStore struct {
 	keyGen KeyGenFunc
 	// session serializer
 	serializer SessionSerializer
+	// codecs to encode/decode data
+	codecs []securecookie.Codec
 }
 
 // KeyGenFunc defines a function used by store to generate a key
 type KeyGenFunc func() (string, error)
 
 // NewRedisStore returns a new RedisStore with default configuration
-func NewRedisStore(ctx context.Context, client redis.UniversalClient) (*RedisStore, error) {
+func NewRedisStore(ctx context.Context, client redis.UniversalClient, keyPairs ...[]byte) (*RedisStore, error) {
 
 	rs := &RedisStore{
 		options: sessions.Options{
@@ -44,6 +48,7 @@ func NewRedisStore(ctx context.Context, client redis.UniversalClient) (*RedisSto
 		keyPrefix:  "session:",
 		keyGen:     generateRandomKey,
 		serializer: GobSerializer{},
+		codecs:     securecookie.CodecsFromPairs(keyPairs...),
 	}
 
 	return rs, rs.client.Ping(ctx).Err()
@@ -128,6 +133,24 @@ func (s *RedisStore) Serializer(ss SessionSerializer) {
 	s.serializer = ss
 }
 
+// EncoderSerializer sets the serializer used by the encoder
+func (s *RedisStore) EncoderSerializer(ss securecookie.Serializer) {
+	for _, codec := range s.codecs {
+		if secureCodec, ok := codec.(*securecookie.SecureCookie); ok {
+			secureCodec.SetSerializer(ss)
+		}
+	}
+}
+
+// EncoderMaxLength restricts the maximum length, in bytes, for the cookie value
+func (s *RedisStore) EncoderMaxLength(value int)  {
+	for _, codec := range s.codecs {
+		if secureCodec, ok := codec.(*securecookie.SecureCookie); ok {
+			secureCodec.MaxLength(value)
+		}
+	}
+}
+
 // Close closes the Redis store
 func (s *RedisStore) Close() error {
 	return s.client.Close()
@@ -135,29 +158,26 @@ func (s *RedisStore) Close() error {
 
 // save writes session in Redis
 func (s *RedisStore) save(ctx context.Context, session *sessions.Session) error {
-
-	b, err := s.serializer.Serialize(session)
+	encodedData, err := securecookie.EncodeMulti(session.Name(), session.Values, s.codecs...)
 	if err != nil {
 		return err
 	}
 
-	return s.client.Set(ctx, s.keyPrefix+session.ID, b, time.Duration(session.Options.MaxAge)*time.Second).Err()
+	return s.client.Set(ctx, s.keyPrefix+session.ID, encodedData, time.Duration(session.Options.MaxAge)*time.Second).Err()
 }
 
 // load reads session from Redis
 func (s *RedisStore) load(ctx context.Context, session *sessions.Session) error {
-
 	cmd := s.client.Get(ctx, s.keyPrefix+session.ID)
 	if cmd.Err() != nil {
 		return cmd.Err()
 	}
-
-	b, err := cmd.Bytes()
+	d, err := cmd.Bytes()
 	if err != nil {
 		return err
 	}
-
-	return s.serializer.Deserialize(b, session)
+	
+	return securecookie.DecodeMulti(session.Name(), string(d), &session.Values, s.codecs...)
 }
 
 // delete deletes session in Redis
